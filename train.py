@@ -11,9 +11,9 @@ except:
     pass
 
 from torchvision.utils import make_grid
-from torch.optim.swa_utils import AveragedModel, S
+from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
 
-from renderer.modules import VQVAE, Predictor
+from renderer.modules import VQVAE
 from renderer.renderer import EmojiRenderer
 
 from accelerate import Accelerator
@@ -24,30 +24,28 @@ class MaskedLoss(nn.Module):
         self,
         mask_multiplier,
         device,
-        max_epochs,
         img_size=256,
-        criterion=F.l1_loss,
+        criterion=F.mse_loss,
         use_perceptual=True,
     ):
         super().__init__()
         self.mask_multiplier = mask_multiplier
         self.device = device
-        self.max_epochs = max_epochs
         self.img_size = img_size
         self.use_perceptual = use_perceptual
         self.criterion = criterion
         if use_perceptual:
             self.perceptual = lpips.LPIPS(net="alex", verbose=False)
+            self.perceptual.eval()
 
-    def forward(self, input, target, epoch):
+    def forward(self, input, target):
         mask = torch.mean(target, dim=1)
 
-        masked_weight = (-9 * epoch / self.max_epochs) + self.mask_multiplier
         whitespace = torch.eq(mask, torch.ones_like(mask))
         mask = torch.where(
             whitespace,
             torch.ones_like(mask, device=self.device),
-            torch.ones_like(mask, device=self.device) * masked_weight,
+            torch.ones_like(mask, device=self.device) * self.mask_multiplier,
         )
         mask = mask.view(-1, 1, self.img_size, self.img_size)
         loss = torch.mean(self.criterion(input, target, reduction="none") * mask)
@@ -55,7 +53,6 @@ class MaskedLoss(nn.Module):
             loss += torch.mean(self.perceptual(input, target) * mask)
 
         return loss
-
 
 def train(config, args):
     accelerator = Accelerator(
@@ -68,36 +65,32 @@ def train(config, args):
     torch.backends.cudnn.benchmark = True
 
     vae = VQVAE()
-    predictor = Predictor(out_dim=2 ** 16)
     er = EmojiRenderer()
 
-    criterion_latent = nn.MSELoss()
-    criterion_reconstruction = MaskedLoss(
-        config["mask_weight"], accelerator.device, config["num_epochs"]
-    )
+    criterion_reconstruction = MaskedLoss(config["mask_weight"], accelerator.device)
 
     optimizer_vae = AdamW(
         vae.parameters(), lr=config["lr"], betas=(config["adam_beta"], 0.999)
     )
 
-    optimizer_p = AdamW(
-        predictor.parameters(), lr=config["lr"], betas=(config["adam_beta"], 0.999)
+
+    scheduler_vae = CosineAnnealingWarmRestarts(
+        optimizer_vae, T_0=config["lr_decay_step"], T_mult=1, eta_min=1e-6
     )
-    # TODO: Implement EMA 
+
+    
+
+    # TODO: Implement EMA
 
     (
         vae,
-        predictor,
         optimizer_vae,
-        optimizer_p,
-        criterion_latent,
+        scheduler_vae,
         criterion_reconstruction,
     ) = accelerator.prepare(
         vae,
-        predictor,
         optimizer_vae,
-        optimizer_p,
-        criterion_latent,
+        scheduler_vae,
         criterion_reconstruction,
     )
 
@@ -126,10 +119,8 @@ def train(config, args):
 
     for epoch in range(start_epoch, config["num_epochs"]):
         vae.train()
-        predictor.train()
 
         optimizer_vae.zero_grad()
-        optimizer_p.zero_grad()
 
         emoji_idx = torch.randint(
             0, 4099, (config["batch_size"],), device=accelerator.device
@@ -140,21 +131,21 @@ def train(config, args):
 
         actual = er.generate_batch(list(zip(emoji_idx, pos)), accelerator.device)
 
-        latent, rendered, _, loss_codebook = vae(actual)
+        rendered, _, loss_codebook = vae(actual)
 
         # loss_render = criterion(rendered, actual)
-        loss_latent = criterion_latent(predictor(emoji_idx, pos), latent)
-        loss_reconstruction = criterion_reconstruction(rendered, actual, epoch)
+        loss_reconstruction = criterion_reconstruction(rendered, actual)
 
         # accelerator.backward(loss_render, retain_graph=True)
-        accelerator.backward(loss_reconstruction + loss_codebook, retain_graph=True)
-        accelerator.backward(loss_latent)
-
-        optimizer_vae.step()
-        optimizer_p.step()
+        if (epoch + 1) % config["gradient_update_every_n_steps"] == 0:
+            accelerator.backward(
+                loss_reconstruction + loss_codebook,
+                retain_graph=True,
+            )
+            optimizer_vae.step()
+            scheduler_vae.step()
 
         if epoch % config["checkpoint_every_n_steps"] == 0:
-
             accelerator.get_tracker("tensorboard").tracker.add_image(
                 "rendered", make_grid(F.sigmoid(rendered[:4]), normalize=True), epoch
             )
@@ -163,12 +154,11 @@ def train(config, args):
             )
 
             accelerator.print(
-                f"epoch {epoch}, loss latent: {loss_latent.item()}, loss reconstruction: {loss_reconstruction.item()}"
+                f"epoch {epoch}, loss reconstruction: {loss_reconstruction.item()}, Loss codebook: {loss_codebook.item()}"
             )
             if not args.no_tracking:
                 accelerator.log(
-                    {
-                        "loss_latent": loss_latent.item(),
+                    {   
                         "loss_codebook": loss_codebook.item(),
                         "epoch": epoch,
                         "loss_reconstruction": loss_reconstruction.item(),
@@ -241,13 +231,15 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     config = {
-        "num_epochs": int(6e5),
+        "num_epochs": int(4e6),
         "img_size": 256,
         "mask_weight": 10,
-        "adam_beta": 0.97,
+        "adam_beta": 0.9,
         "lr": 1e-3,
-        "batch_size": 32,
-        "checkpoint_every_n_steps": 10,
+        "batch_size": 16,
+        "lr_decay_step": int(5e4),
+        "gradient_update_every_n_steps": 4,
+        "checkpoint_every_n_steps": 1000,
     }
 
     train(config, args)

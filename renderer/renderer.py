@@ -19,11 +19,11 @@ class EmojiRenderer:
 
         self.total_emojis = len(self.all_emojis)
 
-        self.min_angle = -45
-        self.max_angle = 45
+        self.min_angle = -90
+        self.max_angle = 90
 
-        self.min_resize = 0.9
-        self.max_resize = 1.1
+        self.min_resize = 0.5
+        self.max_resize = 2
 
         self.transform = Compose(
             [ToTensor(), Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))]

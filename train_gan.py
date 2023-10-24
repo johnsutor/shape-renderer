@@ -119,7 +119,11 @@ def train(config, args):
             path = os.path.basename(args.resume_from_checkpoint)
         else:
             # Get the most recent checkpoint
-            dirs = [os.path.join(args.output_dir, f.name) for f in os.scandir(args.output_dir) if f.is_dir()]
+            dirs = [
+                os.path.join(args.output_dir, f.name)
+                for f in os.scandir(args.output_dir)
+                if f.is_dir()
+            ]
             dirs.sort(key=os.path.getctime)
             path = dirs[-1]
         training_difference = os.path.splitext(path)[0]
@@ -180,9 +184,7 @@ def train(config, args):
                 discriminator(rendered, emoji_idx, pos)[0]
             )
 
-            accelerator.backward(
-                loss_generator_discriminator
-            )
+            accelerator.backward(loss_generator_discriminator)
             optimizer_generator.step()
 
         if epoch % config["checkpoint_every_n_steps"] == 0 and epoch != 0:
@@ -223,7 +225,11 @@ def train(config, args):
             accelerator.save_state(output_dir)
 
             if len(os.listdir(args.output_dir)) > config["total_limit"]:
-                dirs = [os.path.join(args.output_dir, f.name) for f in os.scandir(args.output_dir) if f.is_dir()]
+                dirs = [
+                    os.path.join(args.output_dir, f.name)
+                    for f in os.scandir(args.output_dir)
+                    if f.is_dir()
+                ]
                 dirs.sort(key=os.path.getctime)
                 for i in range(len(dirs) - config["total_limit"]):
                     shutil.rmtree(dirs[i])
@@ -296,7 +302,7 @@ if __name__ == "__main__":
         "lr_discriminator": 4e-4,
         "batch_size": 64,
         "checkpoint_every_n_steps": 500,
-        "total_limit": 5
+        "total_limit": 5,
     }
 
     train(config, args)
